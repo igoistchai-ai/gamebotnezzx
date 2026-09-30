@@ -892,7 +892,7 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
     # Admin natural-language actions
     if is_admin(uid):
         parts = raw.strip().split()
-        command = parts[0].lower() if parts else ""
+        command = parts[0].lower().lstrip("/") if parts else ""
 
         if command in {"статистика", "стата"}:
             total_games = sum(x["games"] for x in USERS.values())
@@ -906,7 +906,7 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        if command in {"выдать", "выдатьбаланс"} and len(parts) >= 3:
+        if command in {"выдать", "выдатьбаланс", "add", "addbalance"} and len(parts) >= 3:
             target = parts[1]
             try:
                 amount = int(parts[2])
@@ -948,7 +948,7 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        if command in {"снять", "снятьбаланс"} and len(parts) >= 3:
+        if command in {"снять", "снятьбаланс", "remove", "removebalance"} and len(parts) >= 3:
             target = parts[1]
             try:
                 amount = abs(int(parts[2]))
@@ -1090,11 +1090,9 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    await update.message.reply_text(
-        "❓ Неизвестная команда.\n\n"
-        "Напишите «инфо», чтобы увидеть список доступных действий.",
-        reply_markup=home_keyboard(uid),
-    )
+    # Do not answer to ordinary chat messages. Only recognized command words
+    # and explicit admin actions above should be handled.
+    return
 
 
 # ----------------------------------------------------------
