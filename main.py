@@ -1,61 +1,92 @@
-import os, json, hmac, hashlib, secrets, asyncio
+import os
+import hmac
+import hashlib
+import secrets
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
-
-from fastapi import FastAPI
 from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 import uvicorn
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# ============================================================
-# NEZZX GAME — SINGLE FILE VERSION
+# ==========================================================
+# NEZZX GAME BOT — ONE FILE
+# Telegram UI styled after the supplied dark game-bot examples.
 # Virtual points only. No real-money deposits/withdrawals.
-# ============================================================
+# ==========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+if OWNER_ID:
+    ADMIN_IDS.add(OWNER_ID)
+
 PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+
 DEFAULT_BALANCE = int(os.getenv("DEFAULT_BALANCE", "10000"))
 MIN_BET = int(os.getenv("MIN_BET", "10"))
 MAX_BET = int(os.getenv("MAX_BET", "1000000"))
 DAILY_BONUS = int(os.getenv("DAILY_BONUS", "1000"))
-
-if OWNER_ID:
-    ADMIN_IDS.add(OWNER_ID)
+GAME_TIMEOUT_MINUTES = int(os.getenv("GAME_TIMEOUT_MINUTES", "30"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
+    raise RuntimeError("BOT_TOKEN is not configured")
 
-# ---------------- In-memory storage ----------------
-# For production on Render, attach PostgreSQL and replace these stores
-# with persistent storage. This single-file edition is intentionally simple.
+# ----------------------------------------------------------
+# Simple runtime storage
+# ----------------------------------------------------------
+# This version keeps game state in memory to keep the entire
+# project inside main.py. A later PostgreSQL version can use
+# the same handlers/game functions without changing the UI.
 
-USERS = {}
-ACTIVE_GAMES = {}
-TRANSACTIONS = []
-DAILY = {}
-REFERRALS = {}
-LOCK = asyncio.Lock()
+USERS: dict[int, dict] = {}
+ACTIVE_GAMES: dict[int, dict] = {}
+TRANSACTIONS: list[dict] = []
+DAILY_BONUS_STATE: dict[int, datetime] = {}
+REFERRALS: dict[int, int] = {}
+LOCK = None
 
-# ---------------- Helpers ----------------
+BOARD_SIZE = 25
+TOWER_FLOORS = 10
 
-def now():
+
+# ----------------------------------------------------------
+# Generic helpers
+# ----------------------------------------------------------
+
+def now() -> datetime:
     return datetime.now(timezone.utc)
 
-def fmt(n):
-    return f"{int(n):,}".replace(",", " ")
 
-def is_admin(uid):
-    return uid in ADMIN_IDS
+def fmt(value: int | Decimal) -> str:
+    return f"{int(value):,}".replace(",", " ")
 
-def user(uid, tg=None):
-    if uid not in USERS:
-        USERS[uid] = {
-            "id": uid,
-            "username": getattr(tg, "username", None),
-            "first_name": getattr(tg, "first_name", ""),
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def get_user(user_id: int, tg_user=None) -> dict:
+    if user_id not in USERS:
+        USERS[user_id] = {
+            "id": user_id,
+            "username": getattr(tg_user, "username", None),
+            "first_name": getattr(tg_user, "first_name", "") or "",
             "balance": DEFAULT_BALANCE,
             "games": 0,
             "wins": 0,
@@ -65,650 +96,1363 @@ def user(uid, tg=None):
             "streak": 0,
             "banned": False,
             "created": now(),
+            "last_activity": now(),
         }
-    elif tg:
-        USERS[uid]["username"] = tg.username
-        USERS[uid]["first_name"] = tg.first_name
-    return USERS[uid]
+        TRANSACTIONS.append(
+            {
+                "time": now(),
+                "user_id": user_id,
+                "type": "start_balance",
+                "amount": DEFAULT_BALANCE,
+                "before": 0,
+                "after": DEFAULT_BALANCE,
+                "description": "Стартовый баланс",
+            }
+        )
+    elif tg_user is not None:
+        USERS[user_id]["username"] = tg_user.username
+        USERS[user_id]["first_name"] = tg_user.first_name or ""
+        USERS[user_id]["last_activity"] = now()
+    return USERS[user_id]
 
-def tx(uid, amount, kind, description):
-    u = USERS[uid]
+
+def change_balance(
+    user_id: int,
+    amount: int,
+    tx_type: str,
+    description: str,
+    admin_id: int | None = None,
+) -> int:
+    u = get_user(user_id)
+    amount = int(amount)
+    if amount < 0 and u["balance"] + amount < 0:
+        raise ValueError("Недостаточно баллов.")
     before = u["balance"]
-    u["balance"] += int(amount)
-    TRANSACTIONS.append({
-        "time": now(),
-        "user_id": uid,
-        "type": kind,
-        "amount": int(amount),
-        "before": before,
-        "after": u["balance"],
-        "description": description,
-    })
+    u["balance"] += amount
+    TRANSACTIONS.append(
+        {
+            "time": now(),
+            "user_id": user_id,
+            "type": tx_type,
+            "amount": amount,
+            "before": before,
+            "after": u["balance"],
+            "description": description,
+            "admin_id": admin_id,
+        }
+    )
     return u["balance"]
 
-def add_xp(u, amount):
-    u["xp"] += amount
+
+def add_xp(u: dict, amount: int) -> None:
+    u["xp"] += max(0, int(amount))
     while u["xp"] >= u["level"] * 100:
         u["xp"] -= u["level"] * 100
         u["level"] += 1
 
-def hash_seed(seed):
+
+def hash_seed(seed: str) -> str:
     return hashlib.sha256(seed.encode()).hexdigest()
 
-# ---------------- Mines ----------------
 
-BOARD = 25
-MINES_ALLOWED = range(1, 24)
+def separator() -> str:
+    return "• • • • • • • • • • • • • • • • • • •"
 
-def deterministic_positions(server_seed, client_seed, nonce, count):
-    result = []
+
+def safe_edit(q, text: str, keyboard=None):
+    return q.edit_message_text(text, reply_markup=keyboard)
+
+
+# ----------------------------------------------------------
+# Mines
+# ----------------------------------------------------------
+
+def deterministic_positions(server_seed: str, client_seed: str, nonce: int, count: int):
+    positions = []
     counter = 0
-    while len(result) < count:
+
+    while len(positions) < count:
         digest = hmac.new(
             server_seed.encode(),
             f"{client_seed}:{nonce}:{counter}".encode(),
-            hashlib.sha256
+            hashlib.sha256,
         ).digest()
-        for i in range(0, len(digest), 4):
-            pos = int.from_bytes(digest[i:i+4], "big") % BOARD
-            if pos not in result:
-                result.append(pos)
-            if len(result) == count:
-                break
-        counter += 1
-    return sorted(result)
 
-def mines_multiplier(mines, safe):
-    if safe <= 0:
+        for i in range(0, len(digest), 4):
+            pos = int.from_bytes(digest[i:i + 4], "big") % BOARD_SIZE
+            if pos not in positions:
+                positions.append(pos)
+            if len(positions) >= count:
+                break
+
+        counter += 1
+
+    return sorted(positions[:count])
+
+
+def mines_multiplier(mine_count: int, safe_opened: int) -> Decimal:
+    if safe_opened <= 0:
         return Decimal("1.00")
+
+    safe_total = BOARD_SIZE - mine_count
     result = Decimal("1")
-    safe_total = BOARD - mines
-    for k in range(safe):
-        result *= Decimal(BOARD-k) / Decimal(safe_total-k)
+
+    for k in range(safe_opened):
+        result *= Decimal(BOARD_SIZE - k) / Decimal(safe_total - k)
         result *= Decimal("0.96")
+
     return result.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-# ---------------- Tower ----------------
 
-# Tower is 10 floors. Every floor has 4 cells.
-# User chooses 1-4 mines for the tower.
-# A safe pick advances to the next floor.
-TOWER_FLOORS = 10
-TOWER_CELLS = 4
-TOWER_MINES = range(1, 5)
+def new_mines_game(user_id: int, bet: int, mine_count: int) -> dict:
+    seed = secrets.token_hex(32)
+    client_seed = secrets.token_hex(16)
 
-def tower_multiplier(mines, floor):
-    # Virtual-game multiplier. Higher mine count = higher risk.
-    value = Decimal("1")
-    safe = TOWER_CELLS - mines
-    for level in range(floor):
-        value *= Decimal(TOWER_CELLS) / Decimal(max(1, safe))
-        value *= Decimal("0.88")
-    return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    game = {
+        "id": secrets.token_hex(5),
+        "type": "mines",
+        "user_id": user_id,
+        "bet": bet,
+        "mines": mine_count,
+        "server_seed": seed,
+        "server_seed_hash": hash_seed(seed),
+        "client_seed": client_seed,
+        "nonce": 0,
+        "mine_positions": deterministic_positions(
+            seed, client_seed, 0, mine_count
+        ),
+        "opened": set(),
+        "multiplier": Decimal("1.00"),
+        "created": now(),
+    }
+    return game
 
-def tower_layout(seed, game_id, floor, mines):
-    digest = hmac.new(
-        seed.encode(),
-        f"{game_id}:{floor}".encode(),
-        hashlib.sha256
-    ).digest()
-    cells = list(range(4))
-    score = {i: digest[i] for i in cells}
-    cells.sort(key=lambda x: score[x])
-    return set(cells[:mines])
 
-# ---------------- UI ----------------
-
-def home_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Играть", callback_data="menu:games")],
-        [InlineKeyboardButton("Баланс", callback_data="menu:balance"),
-         InlineKeyboardButton("Бонус", callback_data="menu:bonus")],
-        [InlineKeyboardButton("Профиль", callback_data="menu:profile"),
-         InlineKeyboardButton("Рейтинг", callback_data="menu:rating")],
-        [InlineKeyboardButton("Рефералы", callback_data="menu:refs"),
-         InlineKeyboardButton("Chat", callback_data="menu:chat")],
-        [InlineKeyboardButton("Помощь", callback_data="menu:help")],
-    ])
-
-def back_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Назад", callback_data="home")]
-    ])
-
-def games_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Mines", callback_data="game:mines")],
-        [InlineKeyboardButton("Tower", callback_data="game:tower")],
-        [InlineKeyboardButton("Назад", callback_data="home")]
-    ])
-
-def mines_bet_keyboard():
-    vals = [10, 100, 500, 1000, 5000, 10000]
+def mines_keyboard(game: dict) -> InlineKeyboardMarkup:
     rows = []
-    row = []
-    for v in vals:
-        row.append(InlineKeyboardButton(str(v), callback_data=f"mb:{v}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("Назад", callback_data="menu:games")])
-    return InlineKeyboardMarkup(rows)
-
-def mines_count_keyboard(bet):
-    rows = []
-    row = []
-    for n in range(1, 24):
-        row.append(InlineKeyboardButton(str(n), callback_data=f"ms:{bet}:{n}"))
-        if len(row) == 6:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("Назад", callback_data="game:mines")])
-    return InlineKeyboardMarkup(rows)
-
-def tower_bet_keyboard():
-    vals = [10, 100, 500, 1000, 5000, 10000]
-    rows = []
-    row = []
-    for v in vals:
-        row.append(InlineKeyboardButton(str(v), callback_data=f"tb:{v}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("Назад", callback_data="menu:games")])
-    return InlineKeyboardMarkup(rows)
-
-def tower_mines_keyboard(bet):
-    rows = [
-        [InlineKeyboardButton("1 мина", callback_data=f"ts:{bet}:1"),
-         InlineKeyboardButton("2 мины", callback_data=f"ts:{bet}:2")],
-        [InlineKeyboardButton("3 мины", callback_data=f"ts:{bet}:3"),
-         InlineKeyboardButton("4 мины", callback_data=f"ts:{bet}:4")],
-        [InlineKeyboardButton("Назад", callback_data="game:tower")]
-    ]
-    return InlineKeyboardMarkup(rows)
-
-def mines_board(game):
     opened = game["opened"]
-    rows = []
+
     for r in range(5):
         row = []
         for c in range(5):
-            i = r * 5 + c
-            text = "■" if i not in opened else "·"
-            row.append(InlineKeyboardButton(text, callback_data=f"mo:{game['id']}:{i}"))
-        rows.append(row)
-    rows.append([InlineKeyboardButton("Забрать", callback_data=f"mc:{game['id']}")])
-    rows.append([InlineKeyboardButton("Seed Hash", callback_data=f"mv:{game['id']}")])
-    return InlineKeyboardMarkup(rows)
-
-def tower_board(game):
-    rows = []
-    for i in range(4):
-        rows.append([
-            InlineKeyboardButton(
-                "■" if i not in game["current_open"] else "·",
-                callback_data=f"to:{game['id']}:{i}"
+            cell = r * 5 + c
+            symbol = "✅" if cell in opened else "❓"
+            row.append(
+                InlineKeyboardButton(
+                    symbol,
+                    callback_data=f"mine_open:{game['id']}:{cell}",
+                )
             )
-        ])
-    rows.append([InlineKeyboardButton("Забрать", callback_data=f"tc:{game['id']}")])
-    rows.append([InlineKeyboardButton("Seed Hash", callback_data=f"tv:{game['id']}")])
+        rows.append(row)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "💰 Забрать",
+                callback_data=f"mine_cash:{game['id']}",
+            ),
+            InlineKeyboardButton(
+                "🔑 Честность",
+                callback_data=f"mine_verify:{game['id']}",
+            ),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "❌ Отменить",
+                callback_data=f"mine_cancel:{game['id']}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
-# ---------------- Commands ----------------
 
-async def start(update, context):
+# ----------------------------------------------------------
+# Tower
+# ----------------------------------------------------------
+
+def tower_multiplier(mine_count: int, floor: int) -> Decimal:
+    # Virtual-game multiplier curve.
+    # More mines => higher risk and higher multiplier.
+    safe = max(1, 4 - mine_count)
+    result = Decimal("1")
+
+    for _ in range(max(0, floor)):
+        result *= Decimal("4") / Decimal(safe)
+        result *= Decimal("0.88")
+
+    return result.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def tower_layout(server_seed: str, game_id: str, floor: int, mine_count: int):
+    digest = hmac.new(
+        server_seed.encode(),
+        f"{game_id}:{floor}".encode(),
+        hashlib.sha256,
+    ).digest()
+
+    cells = list(range(4))
+    cells.sort(key=lambda x: digest[x])
+    return set(cells[:mine_count])
+
+
+def new_tower_game(user_id: int, bet: int, mine_count: int) -> dict:
+    seed = secrets.token_hex(32)
+    game_id = secrets.token_hex(5)
+
+    game = {
+        "id": game_id,
+        "type": "tower",
+        "user_id": user_id,
+        "bet": bet,
+        "mines": mine_count,
+        "server_seed": seed,
+        "server_seed_hash": hash_seed(seed),
+        "floor": 1,
+        "current_open": set(),
+        "layout": tower_layout(seed, game_id, 1, mine_count),
+        "created": now(),
+    }
+    return game
+
+
+def tower_keyboard(game: dict) -> InlineKeyboardMarkup:
+    row = []
+    for cell in range(4):
+        symbol = "✅" if cell in game["current_open"] else "❓"
+        row.append(
+            InlineKeyboardButton(
+                symbol,
+                callback_data=f"tower_open:{game['id']}:{cell}",
+            )
+        )
+
+    return InlineKeyboardMarkup(
+        [
+            row,
+            [
+                InlineKeyboardButton(
+                    "💰 Забрать",
+                    callback_data=f"tower_cash:{game['id']}",
+                ),
+                InlineKeyboardButton(
+                    "🔑 Честность",
+                    callback_data=f"tower_verify:{game['id']}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Отменить",
+                    callback_data=f"tower_cancel:{game['id']}",
+                )
+            ],
+        ]
+    )
+
+
+# ----------------------------------------------------------
+# Keyboards
+# ----------------------------------------------------------
+
+def back_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("◀️ Назад", callback_data="home")]]
+    )
+
+
+def home_keyboard(uid: int):
+    rows = [
+        [InlineKeyboardButton("🎮 Играть", callback_data="games")],
+        [
+            InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+            InlineKeyboardButton("🎁 Бонус", callback_data="bonus"),
+        ],
+        [
+            InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+            InlineKeyboardButton("🏆 Рейтинг", callback_data="rating"),
+        ],
+        [
+            InlineKeyboardButton("🎟 Рефералы", callback_data="refs"),
+            InlineKeyboardButton("💬 Chat", callback_data="chat"),
+        ],
+        [InlineKeyboardButton("📖 Помощь", callback_data="help")],
+    ]
+
+    if is_admin(uid):
+        rows.insert(0, [InlineKeyboardButton("🟢 АДМИН", callback_data="admin")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def catalog_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💣 Мины", callback_data="game:mines"),
+                InlineKeyboardButton("🏰 Башня", callback_data="game:tower"),
+            ],
+            [
+                InlineKeyboardButton("🎯 Дартс", callback_data="soon:darts"),
+                InlineKeyboardButton("⚽ Футбол", callback_data="soon:football"),
+            ],
+            [
+                InlineKeyboardButton("🎳 Боулинг", callback_data="soon:bowling"),
+                InlineKeyboardButton("🎲 Кубик", callback_data="soon:dice"),
+            ],
+            [
+                InlineKeyboardButton("🎰 Слоты", callback_data="soon:slots"),
+                InlineKeyboardButton("🌐 WEB", callback_data="soon:web"),
+            ],
+            [
+                InlineKeyboardButton("▶️ Играть", callback_data="games")
+            ],
+            [
+                InlineKeyboardButton("◀️ Назад", callback_data="home")
+            ],
+        ]
+    )
+
+
+def amount_keyboard(prefix: str, include_all: bool = False):
+    values = [10, 100, 500, 1000, 5000, 10000]
+    rows = []
+    current = []
+
+    for value in values:
+        current.append(
+            InlineKeyboardButton(
+                f"💵 {value}",
+                callback_data=f"{prefix}:{value}",
+            )
+        )
+        if len(current) == 3:
+            rows.append(current)
+            current = []
+
+    if current:
+        rows.append(current)
+
+    if include_all:
+        rows.append(
+            [InlineKeyboardButton("💎 ВСЕ", callback_data=f"{prefix}:all")]
+        )
+
+    rows.append(
+        [InlineKeyboardButton("✍️ Своя сумма", callback_data="soon:custom")]
+    )
+    rows.append(
+        [InlineKeyboardButton("◀️ Назад", callback_data="games")]
+    )
+
+    return InlineKeyboardMarkup(rows)
+
+
+def mines_count_keyboard(bet: int):
+    rows = []
+    current = []
+
+    for count in range(1, 24):
+        current.append(
+            InlineKeyboardButton(
+                f"💣 {count}",
+                callback_data=f"mines_start:{bet}:{count}",
+            )
+        )
+        if len(current) == 6:
+            rows.append(current)
+            current = []
+
+    if current:
+        rows.append(current)
+
+    rows.append(
+        [InlineKeyboardButton("◀️ Назад", callback_data="game:mines")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def tower_mines_keyboard(bet: int):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💣 1", callback_data=f"tower_start:{bet}:1"),
+                InlineKeyboardButton("💣 2", callback_data=f"tower_start:{bet}:2"),
+            ],
+            [
+                InlineKeyboardButton("💣 3", callback_data=f"tower_start:{bet}:3"),
+                InlineKeyboardButton("💣 4", callback_data=f"tower_start:{bet}:4"),
+            ],
+            [InlineKeyboardButton("◀️ Назад", callback_data="game:tower")],
+        ]
+    )
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("👤 Пользователи", callback_data="adm_users"),
+                InlineKeyboardButton("💰 Баланс", callback_data="adm_balance"),
+            ],
+            [
+                InlineKeyboardButton("📊 Статистика", callback_data="adm_stats"),
+                InlineKeyboardButton("📋 Логи", callback_data="adm_logs"),
+            ],
+            [InlineKeyboardButton("◀️ Назад", callback_data="home")],
+        ]
+    )
+
+
+# ----------------------------------------------------------
+# User commands
+# ----------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    u = user(uid, update.effective_user)
+    u = get_user(uid, update.effective_user)
 
     if context.args and context.args[0].startswith("ref_"):
         try:
-            ref = int(context.args[0][4:])
-            if ref != uid and uid not in REFERRALS:
-                REFERRALS[uid] = ref
+            ref_id = int(context.args[0][4:])
+            if ref_id != uid and uid not in REFERRALS:
+                REFERRALS[uid] = ref_id
         except ValueError:
             pass
 
     await update.message.reply_text(
-        f"NEZZX GAME\n\n"
-        f"Баланс: {fmt(u['balance'])}\n"
-        f"Уровень: {u['level']}\n"
-        f"XP: {u['xp']}",
-        reply_markup=home_keyboard()
+        f"💣 Мины Бот\n"
+        f"неzкс фамилионо...\n\n"
+        f"🎮 NEZZX GAME\n"
+        f"{separator()}\n"
+        f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+        f"🏆 Уровень: {u['level']}\n"
+        f"⭐ XP: {u['xp']}\n\n"
+        f"🎯 Добро пожаловать в игровое меню.",
+        reply_markup=home_keyboard(uid),
     )
 
-async def admin(update, context):
+
+# ----------------------------------------------------------
+# Admin commands
+# ----------------------------------------------------------
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         return
+
     await update.message.reply_text(
-        "ADMIN PANEL\n\n"
-        "/addbalance USER_ID AMOUNT REASON\n"
-        "/removebalance USER_ID AMOUNT REASON\n"
-        "/ban USER_ID REASON\n"
-        "/unban USER_ID\n"
-        "/stats"
+        f"🟢 АДМИН\n"
+        f"{separator()}\n\n"
+        f"👤 /user ID\n"
+        f"💰 /addbalance ID SUM REASON\n"
+        f"💸 /removebalance ID SUM REASON\n"
+        f"🚫 /ban ID REASON\n"
+        f"✅ /unban ID\n"
+        f"📊 /stats",
+        reply_markup=admin_keyboard(),
     )
 
-async def addbalance(update, context):
-    if not is_admin(update.effective_user.id) or len(context.args) < 2:
-        return await update.message.reply_text("Формат: /addbalance ID СУММА ПРИЧИНА")
+
+async def addbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid) or len(context.args) < 2:
+        return await update.message.reply_text(
+            "Формат:\n/addbalance ID СУММА ПРИЧИНА"
+        )
+
     try:
-        target = int(context.args[0])
+        target_id = int(context.args[0])
         amount = int(context.args[1])
         reason = " ".join(context.args[2:]) or "Admin adjustment"
-        u = user(target)
-        new = tx(target, amount, "admin_add", reason)
-        await update.message.reply_text(
-            f"Готово.\nID: {target}\nИзменение: {amount:+}\nБаланс: {fmt(new)}"
+
+        get_user(target_id)
+        old_balance = USERS[target_id]["balance"]
+        new_balance = change_balance(
+            target_id,
+            amount,
+            "admin_add",
+            reason,
+            admin_id=uid,
         )
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
 
-async def removebalance(update, context):
-    if not is_admin(update.effective_user.id) or len(context.args) < 2:
-        return await update.message.reply_text("Формат: /removebalance ID СУММА ПРИЧИНА")
+        await update.message.reply_text(
+            f"✅ Баланс изменён\n\n"
+            f"👤 ID: {target_id}\n"
+            f"💰 Было: {fmt(old_balance)}\n"
+            f"➕ Изменение: {fmt(amount)}\n"
+            f"💰 Стало: {fmt(new_balance)}\n"
+            f"📝 Причина: {reason}"
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Ошибка: {exc}")
+
+
+async def removebalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid) or len(context.args) < 2:
+        return await update.message.reply_text(
+            "Формат:\n/removebalance ID СУММА ПРИЧИНА"
+        )
+
     try:
-        target = int(context.args[0])
-        amount = int(context.args[1])
-        if amount < 0:
-            amount = abs(amount)
-        u = user(target)
-        if u["balance"] < amount:
-            return await update.message.reply_text("У пользователя недостаточно баллов.")
-        new = tx(target, -amount, "admin_remove", " ".join(context.args[2:]) or "Admin removal")
-        await update.message.reply_text(f"Баланс: {fmt(new)}")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        target_id = int(context.args[0])
+        amount = abs(int(context.args[1]))
+        reason = " ".join(context.args[2:]) or "Admin removal"
 
-async def ban(update, context):
-    if not is_admin(update.effective_user.id) or not context.args:
-        return
-    target = int(context.args[0])
-    user(target)["banned"] = True
-    await update.message.reply_text("Пользователь заблокирован.")
+        get_user(target_id)
+        old_balance = USERS[target_id]["balance"]
+        new_balance = change_balance(
+            target_id,
+            -amount,
+            "admin_remove",
+            reason,
+            admin_id=uid,
+        )
 
-async def unban(update, context):
-    if not is_admin(update.effective_user.id) or not context.args:
-        return
-    target = int(context.args[0])
-    user(target)["banned"] = False
-    await update.message.reply_text("Пользователь разблокирован.")
+        await update.message.reply_text(
+            f"✅ Баланс изменён\n\n"
+            f"👤 ID: {target_id}\n"
+            f"💰 Было: {fmt(old_balance)}\n"
+            f"➖ Изменение: {fmt(amount)}\n"
+            f"💰 Стало: {fmt(new_balance)}\n"
+            f"📝 Причина: {reason}"
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Ошибка: {exc}")
 
-async def stats(update, context):
-    if not is_admin(update.effective_user.id):
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid) or not context.args:
         return
-    total_games = sum(x["games"] for x in USERS.values())
+
+    target_id = int(context.args[0])
+    reason = " ".join(context.args[1:]) or "Административная блокировка"
+    get_user(target_id)["banned"] = True
+
     await update.message.reply_text(
-        f"Статистика\n\n"
-        f"Пользователей: {len(USERS)}\n"
-        f"Игр: {total_games}\n"
-        f"Транзакций: {len(TRANSACTIONS)}"
+        f"🚫 Пользователь {target_id} заблокирован.\n"
+        f"Причина: {reason}"
     )
 
-# ---------------- Callback router ----------------
 
-async def callback(update, context):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    u = user(uid, q.from_user)
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid) or not context.args:
+        return
+
+    target_id = int(context.args[0])
+    get_user(target_id)["banned"] = False
+
+    await update.message.reply_text(
+        f"✅ Пользователь {target_id} разблокирован."
+    )
+
+
+async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid) or not context.args:
+        return
+
+    target_id = int(context.args[0])
+    u = get_user(target_id)
+
+    await update.message.reply_text(
+        f"👤 ПОЛЬЗОВАТЕЛЬ\n"
+        f"{separator()}\n\n"
+        f"🆔 ID: {target_id}\n"
+        f"📛 Username: @{u['username'] or 'нет'}\n"
+        f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+        f"🏆 Уровень: {u['level']}\n"
+        f"⭐ XP: {u['xp']}\n"
+        f"🎮 Игр: {u['games']}\n"
+        f"✅ Побед: {u['wins']}\n"
+        f"💥 Поражений: {u['losses']}\n"
+        f"🚫 Бан: {'да' if u['banned'] else 'нет'}"
+    )
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+
+    total_games = sum(x["games"] for x in USERS.values())
+    total_balance = sum(x["balance"] for x in USERS.values())
+
+    await update.message.reply_text(
+        f"📊 СТАТИСТИКА\n"
+        f"{separator()}\n\n"
+        f"👥 Пользователей: {len(USERS)}\n"
+        f"🎮 Игр: {total_games}\n"
+        f"💰 Баланс всех пользователей: {fmt(total_balance)} mCoin\n"
+        f"📋 Транзакций: {len(TRANSACTIONS)}"
+    )
+
+
+# ----------------------------------------------------------
+# Callback router
+# ----------------------------------------------------------
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    uid = query.from_user.id
+    u = get_user(uid, query.from_user)
 
     if u["banned"]:
-        return await q.edit_message_text("Доступ ограничен.", reply_markup=back_keyboard())
+        return await safe_edit(
+            query,
+            "🚫 Доступ ограничен администрацией.",
+            back_keyboard(),
+        )
 
-    data = q.data
+    data = query.data or ""
 
+    # ---------- Home ----------
     if data == "home":
-        return await q.edit_message_text(
-            f"NEZZX GAME\n\nБаланс: {fmt(u['balance'])}\nУровень: {u['level']}",
-            reply_markup=home_keyboard()
+        return await safe_edit(
+            query,
+            f"💣 Мины Бот\n"
+            f"неzкс фамилионо...\n\n"
+            f"🎮 ГЛАВНОЕ МЕНЮ\n"
+            f"{separator()}\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"🏆 Уровень: {u['level']}\n"
+            f"⭐ XP: {u['xp']}",
+            home_keyboard(uid),
         )
 
-    if data == "menu:games":
-        return await q.edit_message_text("Игры\n\nВыберите режим:", reply_markup=games_keyboard())
+    # ---------- Games ----------
+    if data == "games":
+        return await safe_edit(
+            query,
+            f"🕹 КАТАЛОГ ИГР\n"
+            f"{separator()}\n\n"
+            f"ℹ️ В этом разделе вы можете познакомиться\n"
+            f"со всеми доступными играми и запустить их.\n\n"
+            f"💣 Мины — поле 5×5, мин: 1–23\n"
+            f"🏰 Башня — 10 этажей, мин: 1–4",
+            catalog_keyboard(),
+        )
 
+    # ---------- Mines setup ----------
     if data == "game:mines":
-        return await q.edit_message_text(
-            f"Mines\n\nБаланс: {fmt(u['balance'])}\n\nВыберите сумму:",
-            reply_markup=mines_bet_keyboard()
+        return await safe_edit(
+            query,
+            f"🍀 МИНЫ · НАЧНИ ИГРУ!\n"
+            f"{separator()}\n\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"💣 Мин: 1–23\n"
+            f"🎯 Поле: 5×5\n\n"
+            f"💵 Выберите сумму ставки:",
+            amount_keyboard("mines_bet"),
         )
 
-    if data == "game:tower":
-        return await q.edit_message_text(
-            f"Tower\n\nБаланс: {fmt(u['balance'])}\n\nВыберите сумму:",
-            reply_markup=tower_bet_keyboard()
+    if data.startswith("mines_bet:"):
+        bet = (
+            u["balance"]
+            if data.split(":")[1] == "all"
+            else int(data.split(":")[1])
         )
 
-    if data.startswith("mb:"):
-        bet = int(data.split(":")[1])
-        if not MIN_BET <= bet <= MAX_BET or u["balance"] < bet:
-            return await q.edit_message_text("Недопустимая ставка.", reply_markup=back_keyboard())
-        return await q.edit_message_text(
-            f"Mines\n\nСтавка: {fmt(bet)}\nВыберите количество мин: 1–23",
-            reply_markup=mines_count_keyboard(bet)
+        if not MIN_BET <= bet <= MAX_BET:
+            return await safe_edit(
+                query,
+                "❌ Некорректная сумма ставки.",
+                back_keyboard(),
+            )
+
+        if u["balance"] < bet:
+            return await safe_edit(
+                query,
+                "❌ Недостаточно mCoin.",
+                back_keyboard(),
+            )
+
+        return await safe_edit(
+            query,
+            f"🍀 МИНЫ · НАСТРОЙКА\n"
+            f"{separator()}\n\n"
+            f"💵 Ставка: {fmt(bet)} mCoin\n"
+            f"💣 Количество мин: 1–23\n\n"
+            f"🎯 Выберите количество мин:",
+            mines_count_keyboard(bet),
         )
 
-    if data.startswith("ms:"):
-        _, bet, mine_count = data.split(":")
-        bet, mine_count = int(bet), int(mine_count)
-        if mine_count < 1 or mine_count > 23 or u["balance"] < bet:
-            return await q.edit_message_text("Ошибка ставки.", reply_markup=back_keyboard())
+    if data.startswith("mines_start:"):
+        _, bet_raw, mines_raw = data.split(":")
+        bet = int(bet_raw)
+        mines = int(mines_raw)
+
+        if not 1 <= mines <= 23:
+            return await safe_edit(
+                query,
+                "❌ Количество мин должно быть от 1 до 23.",
+                back_keyboard(),
+            )
+
+        if u["balance"] < bet:
+            return await safe_edit(
+                query,
+                "❌ Недостаточно mCoin.",
+                back_keyboard(),
+            )
+
         if uid in ACTIVE_GAMES:
-            return await q.edit_message_text("У вас уже есть активная игра.", reply_markup=back_keyboard())
+            return await safe_edit(
+                query,
+                "⚠️ У вас уже есть активная игра.",
+                back_keyboard(),
+            )
 
-        seed = secrets.token_hex(32)
-        game = {
-            "id": secrets.token_hex(4),
-            "type": "mines",
-            "user_id": uid,
-            "bet": bet,
-            "mines": mine_count,
-            "seed": seed,
-            "seed_hash": hash_seed(seed),
-            "client_seed": secrets.token_hex(8),
-            "nonce": 0,
-            "mine_positions": deterministic_positions(seed, secrets.token_hex(8), 0, mine_count),
-            "opened": set(),
-            "multiplier": Decimal("1.00"),
-            "created": now(),
-        }
-        # Recompute using the actual client seed.
-        game["mine_positions"] = deterministic_positions(
-            seed, game["client_seed"], 0, mine_count
-        )
+        game = new_mines_game(uid, bet, mines)
         ACTIVE_GAMES[uid] = game
-        tx(uid, -bet, "mines_bet", "Mines ставка")
-        u["games"] += 1
+        change_balance(uid, -bet, "mines_bet", "Ставка Mines")
 
-        return await q.edit_message_text(
-            f"Mines\n\n"
-            f"Ставка: {fmt(bet)}\n"
-            f"Мин: {mine_count}\n"
-            f"Множитель: x1.00\n\n"
-            f"Открывайте клетки.",
-            reply_markup=mines_board(game)
+        u["games"] += 1
+        add_xp(u, 5)
+
+        return await safe_edit(
+            query,
+            f"🍀 МИНЫ · НАЧНИ ИГРУ!\n"
+            f"{separator()}\n\n"
+            f"💣 Мин: {mines}\n"
+            f"💵 Ставка: {fmt(bet)} mCoin\n\n"
+            f"🧮 Следующий множитель:\n"
+            f"x{mines_multiplier(mines, 1)}\n\n"
+            f"❓ Открывай клетки:",
+            mines_keyboard(game),
         )
 
-    if data.startswith("mo:"):
-        _, gid, cell = data.split(":")
+    # ---------- Mines play ----------
+    if data.startswith("mine_open:"):
+        _, game_id, cell_raw = data.split(":")
         game = ACTIVE_GAMES.get(uid)
-        if not game or game["id"] != gid:
-            return await q.edit_message_text("Игра не найдена.", reply_markup=back_keyboard())
 
-        cell = int(cell)
+        if not game or game["id"] != game_id or game["type"] != "mines":
+            return await safe_edit(
+                query,
+                "❌ Игра не найдена или уже завершена.",
+                back_keyboard(),
+            )
+
+        if now() - game["created"] > timedelta(minutes=GAME_TIMEOUT_MINUTES):
+            del ACTIVE_GAMES[uid]
+            return await safe_edit(
+                query,
+                "⏰ Игра истекла по таймауту.",
+                back_keyboard(),
+            )
+
+        cell = int(cell_raw)
+
         if cell in game["opened"]:
-            return await q.answer("Уже открыто.")
+            return await query.answer("Эта клетка уже открыта.")
+
         if cell in game["mine_positions"]:
             game["opened"].add(cell)
             u["losses"] += 1
             del ACTIVE_GAMES[uid]
-            return await q.edit_message_text(
-                f"МИНА\n\nСтавка: {fmt(game['bet'])}\nПотеряно: {fmt(game['bet'])}",
-                reply_markup=back_keyboard()
+
+            return await safe_edit(
+                query,
+                f"💥 МИНЫ · ПРОИГРЫШ!\n"
+                f"{separator()}\n\n"
+                f"💣 Мин: {game['mines']}\n"
+                f"💵 Ставка: {fmt(game['bet'])} mCoin\n"
+                f"📦 Открыто клеток: {len(game['opened']) - 1}\n\n"
+                f"💣 Вы попали на мину.",
+                back_keyboard(),
             )
 
         game["opened"].add(cell)
-        game["multiplier"] = mines_multiplier(game["mines"], len(game["opened"]))
+        opened = len(game["opened"])
+        game["multiplier"] = mines_multiplier(game["mines"], opened)
         add_xp(u, 5)
 
-        safe_total = BOARD - game["mines"]
-        if len(game["opened"]) >= safe_total:
+        safe_cells = BOARD_SIZE - game["mines"]
+        if opened >= safe_cells:
             reward = int(Decimal(game["bet"]) * game["multiplier"])
-            tx(uid, reward, "mines_win", "Mines complete")
+            change_balance(uid, reward, "mines_win", "Победа Mines")
             u["wins"] += 1
             del ACTIVE_GAMES[uid]
-            return await q.edit_message_text(
-                f"Победа.\n\nПолучено: {fmt(reward)}\nМножитель: x{game['multiplier']}",
-                reply_markup=back_keyboard()
+
+            return await safe_edit(
+                query,
+                f"🎉 МИНЫ · ПОБЕДА!\n"
+                f"{separator()}\n\n"
+                f"💣 Мин: {game['mines']}\n"
+                f"🧳 Пройдено: {opened}/{safe_cells}\n"
+                f"📈 Множитель: x{game['multiplier']}\n"
+                f"💰 Получено: {fmt(reward)} mCoin",
+                back_keyboard(),
             )
 
-        current = int(Decimal(game["bet"]) * game["multiplier"])
-        return await q.edit_message_text(
-            f"Mines\n\n"
-            f"Ставка: {fmt(game['bet'])}\n"
-            f"Мин: {game['mines']}\n"
-            f"Открыто: {len(game['opened'])}\n"
-            f"Множитель: x{game['multiplier']}\n"
-            f"Забрать: {fmt(current)}",
-            reply_markup=mines_board(game)
+        current_value = int(Decimal(game["bet"]) * game["multiplier"])
+
+        return await safe_edit(
+            query,
+            f"🍀 МИНЫ · ИГРА\n"
+            f"{separator()}\n\n"
+            f"💣 Мин: {game['mines']}\n"
+            f"💵 Ставка: {fmt(game['bet'])} mCoin\n"
+            f"🧳 Пройдено: {opened}/{safe_cells}\n"
+            f"📈 Множитель: x{game['multiplier']}\n"
+            f"💰 Забрать: {fmt(current_value)} mCoin\n\n"
+            f"👇 Следующий ход:",
+            mines_keyboard(game),
         )
 
-    if data.startswith("mc:"):
-        _, gid = data.split(":")
+    if data.startswith("mine_cash:"):
+        _, game_id = data.split(":")
         game = ACTIVE_GAMES.get(uid)
-        if not game or game["id"] != gid:
-            return await q.edit_message_text("Игра не найдена.", reply_markup=back_keyboard())
+
+        if not game or game["id"] != game_id or game["type"] != "mines":
+            return await safe_edit(
+                query,
+                "❌ Игра уже завершена.",
+                back_keyboard(),
+            )
+
         if not game["opened"]:
-            return await q.answer("Сначала откройте клетку.", show_alert=True)
+            return await query.answer(
+                "Сначала откройте хотя бы одну клетку.",
+                show_alert=True,
+            )
 
         reward = int(Decimal(game["bet"]) * game["multiplier"])
-        tx(uid, reward, "mines_cashout", "Mines cashout")
+        change_balance(uid, reward, "mines_cashout", "Забор Mines")
         u["wins"] += 1
         del ACTIVE_GAMES[uid]
-        return await q.edit_message_text(
-            f"Вы забрали выигрыш.\n\nПолучено: {fmt(reward)}\nМножитель: x{game['multiplier']}",
-            reply_markup=back_keyboard()
+
+        return await safe_edit(
+            query,
+            f"💰 МИНЫ · ВЫ ЗАБРАЛИ!\n"
+            f"{separator()}\n\n"
+            f"💣 Мин: {game['mines']}\n"
+            f"📈 Множитель: x{game['multiplier']}\n"
+            f"💰 Получено: {fmt(reward)} mCoin\n\n"
+            f"🔑 Игра завершена.",
+            back_keyboard(),
         )
 
-    if data.startswith("mv:"):
-        _, gid = data.split(":")
+    if data.startswith("mine_cancel:"):
+        _, game_id = data.split(":")
         game = ACTIVE_GAMES.get(uid)
-        if not game or game["id"] != gid:
-            return await q.edit_message_text("Игра не найдена.", reply_markup=back_keyboard())
-        return await q.edit_message_text(
-            f"Provably Fair\n\nServer Seed Hash:\n{game['seed_hash']}\n\n"
-            f"Server Seed раскроется после завершения игры.",
-            reply_markup=back_keyboard()
+
+        if game and game["id"] == game_id:
+            del ACTIVE_GAMES[uid]
+
+        return await safe_edit(
+            query,
+            "❌ Игра отменена.\n\nСтавка не возвращается.",
+            back_keyboard(),
         )
 
-    if data.startswith("tb:"):
-        bet = int(data.split(":")[1])
-        if not MIN_BET <= bet <= MAX_BET or u["balance"] < bet:
-            return await q.edit_message_text("Недопустимая ставка.", reply_markup=back_keyboard())
-        return await q.edit_message_text(
-            f"Tower\n\nСтавка: {fmt(bet)}\nВыберите мин: 1–4",
-            reply_markup=tower_mines_keyboard(bet)
+    if data.startswith("mine_verify:"):
+        _, game_id = data.split(":")
+        game = ACTIVE_GAMES.get(uid)
+
+        if not game or game["id"] != game_id:
+            return await safe_edit(
+                query,
+                "❌ Игра не найдена.",
+                back_keyboard(),
+            )
+
+        return await safe_edit(
+            query,
+            f"🔑 БАШНЯ / МИНЫ · ЧЕСТНОСТЬ\n"
+            f"{separator()}\n\n"
+            f"🔐 SHA-256 Hash:\n"
+            f"{game['server_seed_hash']}\n\n"
+            f"🎲 Client Seed:\n"
+            f"{game['client_seed']}\n\n"
+            f"После завершения игры серверный seed можно использовать для проверки.",
+            back_keyboard(),
         )
 
-    if data.startswith("ts:"):
-        _, bet, mines = data.split(":")
-        bet, mines = int(bet), int(mines)
-        if not 1 <= mines <= 4 or u["balance"] < bet:
-            return await q.edit_message_text("Ошибка ставки.", reply_markup=back_keyboard())
+    # ---------- Tower setup ----------
+    if data == "game:tower":
+        return await safe_edit(
+            query,
+            f"🏰 БАШНЯ · НАЧНИ ИГРУ!\n"
+            f"{separator()}\n\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"🏢 Этажей: {TOWER_FLOORS}\n"
+            f"💣 Мин на этаже: 1–4\n\n"
+            f"💵 Выберите сумму:",
+            amount_keyboard("tower_bet", include_all=True),
+        )
+
+    if data.startswith("tower_bet:"):
+        raw = data.split(":")[1]
+        bet = u["balance"] if raw == "all" else int(raw)
+
+        if not MIN_BET <= bet <= MAX_BET:
+            return await safe_edit(
+                query,
+                "❌ Некорректная ставка.",
+                back_keyboard(),
+            )
+
+        if u["balance"] < bet:
+            return await safe_edit(
+                query,
+                "❌ Недостаточно mCoin.",
+                back_keyboard(),
+            )
+
+        return await safe_edit(
+            query,
+            f"🏰 БАШНЯ · НАСТРОЙКА\n"
+            f"{separator()}\n\n"
+            f"💵 Сумма: {fmt(bet)} mCoin\n"
+            f"💣 Мин: 1–4\n\n"
+            f"🎯 Выберите количество мин:",
+            tower_mines_keyboard(bet),
+        )
+
+    if data.startswith("tower_start:"):
+        _, bet_raw, mines_raw = data.split(":")
+        bet = int(bet_raw)
+        mines = int(mines_raw)
+
+        if not 1 <= mines <= 4:
+            return await safe_edit(
+                query,
+                "❌ На этаже должно быть от 1 до 4 мин.",
+                back_keyboard(),
+            )
+
+        if u["balance"] < bet:
+            return await safe_edit(
+                query,
+                "❌ Недостаточно mCoin.",
+                back_keyboard(),
+            )
+
         if uid in ACTIVE_GAMES:
-            return await q.edit_message_text("У вас уже есть активная игра.", reply_markup=back_keyboard())
+            return await safe_edit(
+                query,
+                "⚠️ У вас уже есть активная игра.",
+                back_keyboard(),
+            )
 
-        seed = secrets.token_hex(32)
-        game = {
-            "id": secrets.token_hex(4),
-            "type": "tower",
-            "user_id": uid,
-            "bet": bet,
-            "mines": mines,
-            "seed": seed,
-            "seed_hash": hash_seed(seed),
-            "floor": 1,
-            "current_open": set(),
-            "created": now(),
-        }
-        game["layout"] = tower_layout(seed, game["id"], 1, mines)
+        game = new_tower_game(uid, bet, mines)
         ACTIVE_GAMES[uid] = game
-        tx(uid, -bet, "tower_bet", "Tower ставка")
-        u["games"] += 1
+        change_balance(uid, -bet, "tower_bet", "Ставка Tower")
 
-        return await q.edit_message_text(
-            f"Tower\n\n"
-            f"Ставка: {fmt(bet)}\n"
-            f"Мин: {mines}\n"
-            f"Этаж: 1/{TOWER_FLOORS}\n"
-            f"Множитель: x{tower_multiplier(mines, 1)}\n\n"
-            f"Выберите клетку.",
-            reply_markup=tower_board(game)
+        u["games"] += 1
+        add_xp(u, 5)
+
+        return await safe_edit(
+            query,
+            f"🍀 БАШНЯ · НАЧНИ ИГРУ!\n"
+            f"{separator()}\n\n"
+            f"💣 Мин: {mines}\n"
+            f"💵 Ставка: {fmt(bet)} mCoin\n"
+            f"🏢 Этаж: 1/{TOWER_FLOORS}\n"
+            f"📈 Следующий множитель: x{tower_multiplier(mines, 1)}\n\n"
+            f"❓ Выберите одну из 4 клеток:",
+            tower_keyboard(game),
         )
 
-    if data.startswith("to:"):
-        _, gid, cell = data.split(":")
+    # ---------- Tower play ----------
+    if data.startswith("tower_open:"):
+        _, game_id, cell_raw = data.split(":")
         game = ACTIVE_GAMES.get(uid)
-        if not game or game["id"] != gid or game["type"] != "tower":
-            return await q.edit_message_text("Игра не найдена.", reply_markup=back_keyboard())
 
-        cell = int(cell)
+        if (
+            not game
+            or game["id"] != game_id
+            or game["type"] != "tower"
+        ):
+            return await safe_edit(
+                query,
+                "❌ Игра не найдена.",
+                back_keyboard(),
+            )
+
+        if now() - game["created"] > timedelta(minutes=GAME_TIMEOUT_MINUTES):
+            del ACTIVE_GAMES[uid]
+            return await safe_edit(
+                query,
+                "⏰ Игра истекла по таймауту.",
+                back_keyboard(),
+            )
+
+        cell = int(cell_raw)
+
+        if cell in game["current_open"]:
+            return await query.answer("Клетка уже выбрана.")
+
         if cell in game["layout"]:
             u["losses"] += 1
+            floor_lost = game["floor"]
             del ACTIVE_GAMES[uid]
-            return await q.edit_message_text(
-                f"Мина на этаже {game['floor']}.\n\nПотеряно: {fmt(game['bet'])}",
-                reply_markup=back_keyboard()
+
+            return await safe_edit(
+                query,
+                f"💥 БАШНЯ · ПРОИГРЫШ!\n"
+                f"{separator()}\n\n"
+                f"💣 Мин: {game['mines']}\n"
+                f"🏢 Этаж: {floor_lost}/{TOWER_FLOORS}\n"
+                f"💵 Ставка: {fmt(game['bet'])} mCoin\n"
+                f"📦 Пройдено: {max(0, floor_lost - 1)} из {TOWER_FLOORS}",
+                back_keyboard(),
             )
 
         game["current_open"].add(cell)
-        floor = game["floor"]
-        mult = tower_multiplier(game["mines"], floor)
+        current_floor = game["floor"]
         add_xp(u, 7)
 
-        if floor >= TOWER_FLOORS:
-            reward = int(Decimal(game["bet"]) * mult)
-            tx(uid, reward, "tower_win", "Tower complete")
+        if current_floor >= TOWER_FLOORS:
+            multiplier = tower_multiplier(game["mines"], TOWER_FLOORS)
+            reward = int(Decimal(game["bet"]) * multiplier)
+            change_balance(uid, reward, "tower_win", "Победа Tower")
             u["wins"] += 1
             del ACTIVE_GAMES[uid]
-            return await q.edit_message_text(
-                f"Башня пройдена.\n\nПолучено: {fmt(reward)}\nМножитель: x{mult}",
-                reply_markup=back_keyboard()
+
+            return await safe_edit(
+                query,
+                f"🎉 БАШНЯ · ПРОЙДЕНА!\n"
+                f"{separator()}\n\n"
+                f"💣 Мин: {game['mines']}\n"
+                f"🏢 Пройдено: {TOWER_FLOORS}/{TOWER_FLOORS}\n"
+                f"📈 Множитель: x{multiplier}\n"
+                f"💰 Получено: {fmt(reward)} mCoin",
+                back_keyboard(),
             )
 
         game["floor"] += 1
         game["current_open"] = set()
-        game["layout"] = tower_layout(game["seed"], game["id"], game["floor"], game["mines"])
-
-        return await q.edit_message_text(
-            f"Tower\n\n"
-            f"Ставка: {fmt(game['bet'])}\n"
-            f"Мин: {game['mines']}\n"
-            f"Этаж: {game['floor']}/{TOWER_FLOORS}\n"
-            f"Множитель: x{tower_multiplier(game['mines'], game['floor'])}\n"
-            f"Забрать: {fmt(int(Decimal(game['bet']) * tower_multiplier(game['mines'], game['floor'])))}",
-            reply_markup=tower_board(game)
+        game["layout"] = tower_layout(
+            game["server_seed"],
+            game["id"],
+            game["floor"],
+            game["mines"],
         )
 
-    if data.startswith("tc:"):
-        _, gid = data.split(":")
+        multiplier = tower_multiplier(game["mines"], game["floor"])
+        current_value = int(Decimal(game["bet"]) * multiplier)
+
+        return await safe_edit(
+            query,
+            f"🏰 БАШНЯ · ИГРА\n"
+            f"{separator()}\n\n"
+            f"💣 Мин: {game['mines']}\n"
+            f"💵 Ставка: {fmt(game['bet'])} mCoin\n"
+            f"🏢 Этаж: {game['floor']}/{TOWER_FLOORS}\n"
+            f"📈 Множитель: x{multiplier}\n"
+            f"💰 Забрать: {fmt(current_value)} mCoin\n\n"
+            f"❓ Выберите клетку:",
+            tower_keyboard(game),
+        )
+
+    if data.startswith("tower_cash:"):
+        _, game_id = data.split(":")
         game = ACTIVE_GAMES.get(uid)
-        if not game or game["id"] != gid or game["type"] != "tower":
-            return await q.edit_message_text("Игра не найдена.", reply_markup=back_keyboard())
-        floor = max(1, game["floor"] - 1)
-        mult = tower_multiplier(game["mines"], floor)
-        reward = int(Decimal(game["bet"]) * mult)
-        tx(uid, reward, "tower_cashout", "Tower cashout")
+
+        if not game or game["id"] != game_id:
+            return await safe_edit(
+                query,
+                "❌ Игра не найдена.",
+                back_keyboard(),
+            )
+
+        multiplier = tower_multiplier(
+            game["mines"],
+            max(1, game["floor"] - 1),
+        )
+        reward = int(Decimal(game["bet"]) * multiplier)
+        change_balance(uid, reward, "tower_cashout", "Забор Tower")
         u["wins"] += 1
         del ACTIVE_GAMES[uid]
-        return await q.edit_message_text(
-            f"Вы забрали награду.\n\nПолучено: {fmt(reward)}\nМножитель: x{mult}",
-            reply_markup=back_keyboard()
+
+        return await safe_edit(
+            query,
+            f"💰 БАШНЯ · ВЫ ЗАБРАЛИ!\n"
+            f"{separator()}\n\n"
+            f"💣 Мин: {game['mines']}\n"
+            f"🏢 Пройдено: {max(0, game['floor'] - 1)} этажей\n"
+            f"📈 Множитель: x{multiplier}\n"
+            f"💰 Получено: {fmt(reward)} mCoin",
+            back_keyboard(),
         )
 
-    if data.startswith("tv:"):
-        _, gid = data.split(":")
+    if data.startswith("tower_cancel:"):
+        _, game_id = data.split(":")
         game = ACTIVE_GAMES.get(uid)
-        if not game:
-            return await q.edit_message_text("Игра не найдена.", reply_markup=back_keyboard())
-        return await q.edit_message_text(
-            f"Provably Fair\n\nServer Seed Hash:\n{game['seed_hash']}",
-            reply_markup=back_keyboard()
+
+        if game and game["id"] == game_id:
+            del ACTIVE_GAMES[uid]
+
+        return await safe_edit(
+            query,
+            "❌ Башня отменена.\n\nСтавка не возвращается.",
+            back_keyboard(),
         )
 
-    if data == "menu:balance":
-        return await q.edit_message_text(
-            f"Баланс\n\n{fmt(u['balance'])} баллов",
-            reply_markup=back_keyboard()
+    if data.startswith("tower_verify:"):
+        _, game_id = data.split(":")
+        game = ACTIVE_GAMES.get(uid)
+
+        if not game or game["id"] != game_id:
+            return await safe_edit(
+                query,
+                "❌ Игра не найдена.",
+                back_keyboard(),
+            )
+
+        return await safe_edit(
+            query,
+            f"🔑 БАШНЯ · ЧЕСТНОСТЬ\n"
+            f"{separator()}\n\n"
+            f"🔐 SHA-256 Hash:\n"
+            f"{game['server_seed_hash']}\n\n"
+            f"🏢 Текущий этаж: {game['floor']}/{TOWER_FLOORS}",
+            back_keyboard(),
         )
 
-    if data == "menu:bonus":
-        last = DAILY.get(uid)
+    # ---------- Main sections ----------
+    if data == "balance":
+        return await safe_edit(
+            query,
+            f"💰 БАЛАНС\n"
+            f"{separator()}\n\n"
+            f"💵 {fmt(u['balance'])} mCoin",
+            back_keyboard(),
+        )
+
+    if data == "bonus":
+        last = DAILY_BONUS_STATE.get(uid)
+
         if last and now() - last < timedelta(hours=24):
-            return await q.edit_message_text("Ежедневный бонус уже получен.", reply_markup=back_keyboard())
-        DAILY[uid] = now()
-        reward = DAILY_BONUS
-        tx(uid, reward, "daily_bonus", "Daily bonus")
+            return await safe_edit(
+                query,
+                "🎁 БОНУС\n"
+                f"{separator()}\n\n"
+                "⏳ Ежедневный бонус уже получен.\n"
+                "Возвращайтесь после 24 часов.",
+                back_keyboard(),
+            )
+
+        DAILY_BONUS_STATE[uid] = now()
         u["streak"] += 1
+
+        reward = DAILY_BONUS + max(0, u["streak"] - 1) * 250
+        change_balance(uid, reward, "daily_bonus", "Ежедневный бонус")
         add_xp(u, 20)
-        return await q.edit_message_text(
-            f"Бонус получен.\n\n+{fmt(reward)} баллов\nStreak: {u['streak']}",
-            reply_markup=back_keyboard()
+
+        return await safe_edit(
+            query,
+            f"🎁 БОНУС\n"
+            f"{separator()}\n\n"
+            f"🎉 Тебе выдан бонус:\n"
+            f"💰 +{fmt(reward)} mCoin\n\n"
+            f"🔥 Streak: {u['streak']}\n\n"
+            f"👇 Следующий бонус будет доступен позже.",
+            back_keyboard(),
         )
 
-    if data == "menu:profile":
-        wr = (u["wins"] / u["games"] * 100) if u["games"] else 0
-        return await q.edit_message_text(
-            f"Профиль\n\n"
-            f"ID: {uid}\n"
-            f"Баланс: {fmt(u['balance'])}\n"
-            f"Уровень: {u['level']}\n"
-            f"XP: {u['xp']}\n"
-            f"Игр: {u['games']}\n"
-            f"Побед: {u['wins']}\n"
-            f"Поражений: {u['losses']}\n"
-            f"Winrate: {wr:.1f}%",
-            reply_markup=back_keyboard()
+    if data == "profile":
+        games = u["games"]
+        winrate = (u["wins"] / games * 100) if games else 0
+
+        return await safe_edit(
+            query,
+            f"👤 ПРОФИЛЬ\n"
+            f"{separator()}\n\n"
+            f"🆔 ID: {uid}\n"
+            f"📛 Username: @{u['username'] or 'нет'}\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"🏆 Уровень: {u['level']}\n"
+            f"⭐ XP: {u['xp']}\n"
+            f"💣 Сыграно игр: {games}\n"
+            f"✅ Выиграно: {u['wins']}\n"
+            f"💥 Проиграно: {u['losses']}\n"
+            f"📈 Winrate: {winrate:.1f}%\n"
+            f"🔥 Streak: {u['streak']}",
+            back_keyboard(),
         )
 
-    if data == "menu:refs":
-        bot = await context.bot.get_me()
-        link = f"https://t.me/{bot.username}?start=ref_{uid}"
-        count = sum(1 for x in REFERRALS.values() if x == uid)
-        return await q.edit_message_text(
-            f"Рефералы\n\n"
-            f"Приглашено: {count}\n\n"
-            f"{link}",
-            reply_markup=back_keyboard()
+    if data == "refs":
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start=ref_{uid}"
+        count = sum(1 for ref in REFERRALS.values() if ref == uid)
+
+        return await safe_edit(
+            query,
+            f"🎟 РЕФЕРАЛЫ\n"
+            f"{separator()}\n\n"
+            f"👥 Приглашено: {count}\n\n"
+            f"🔗 Твоя ссылка:\n{link}",
+            back_keyboard(),
         )
 
-    if data == "menu:rating":
-        top = sorted(USERS.values(), key=lambda x: x["balance"], reverse=True)[:10]
-        text = "Рейтинг\n\n"
-        for i, x in enumerate(top, 1):
-            text += f"{i}. {x['first_name'] or x['id']} — {fmt(x['balance'])}\n"
-        return await q.edit_message_text(text, reply_markup=back_keyboard())
+    if data == "rating":
+        top = sorted(
+            USERS.values(),
+            key=lambda x: x["balance"],
+            reverse=True,
+        )[:10]
 
-    if data == "menu:chat":
-        context.user_data["chat"] = True
-        return await q.edit_message_text(
-            "Chat включён.\n\nНапишите сообщение следующим сообщением.",
-            reply_markup=back_keyboard()
+        lines = [
+            "🏆 РЕЙТИНГ",
+            separator(),
+            "",
+        ]
+
+        for index, item in enumerate(top, 1):
+            name = item["first_name"] or str(item["id"])
+            lines.append(
+                f"{index}. {name} — {fmt(item['balance'])} mCoin"
+            )
+
+        return await safe_edit(
+            query,
+            "\n".join(lines),
+            back_keyboard(),
         )
 
-    if data == "menu:help":
-        return await q.edit_message_text(
-            "Помощь\n\n"
-            "Mines: количество мин 1–23.\n"
-            "Tower: количество мин 1–4.\n"
-            "Вы можете забрать виртуальный выигрыш до проигрыша.\n\n"
-            "Используются только виртуальные баллы.",
-            reply_markup=back_keyboard()
+    if data == "chat":
+        context.user_data["chat_mode"] = True
+
+        return await safe_edit(
+            query,
+            f"💬 CHAT\n"
+            f"{separator()}\n\n"
+            f"✍️ Отправьте сообщение следующим сообщением.\n\n"
+            f"Для выхода используйте /start.",
+            back_keyboard(),
         )
 
-async def text_handler(update, context):
-    if not context.user_data.get("chat"):
+    if data == "help":
+        return await safe_edit(
+            query,
+            f"📖 ПОМОЩЬ\n"
+            f"{separator()}\n\n"
+            f"💣 Мины — поле 5×5, мин можно выбрать от 1 до 23.\n"
+            f"🏰 Башня — 10 этажей, на каждом 1–4 мины.\n"
+            f"💰 Cashout позволяет забрать текущую виртуальную награду.\n"
+            f"🔑 Честность показывает hash игрового seed.\n"
+            f"🎁 Ежедневный бонус увеличивает streak.\n\n"
+            f"Все mCoin внутри этого проекта являются виртуальными баллами.",
+            back_keyboard(),
+        )
+
+    # ---------- Admin UI ----------
+    if data == "admin":
+        if not is_admin(uid):
+            return await safe_edit(query, "⛔ Доступ запрещён.", back_keyboard())
+
+        return await safe_edit(
+            query,
+            f"🟢 АДМИН · ПАНЕЛЬ\n"
+            f"{separator()}\n\n"
+            f"👤 Пользователи\n"
+            f"💰 Выдача / снятие mCoin\n"
+            f"📊 Статистика\n"
+            f"📋 Логи операций",
+            admin_keyboard(),
+        )
+
+    if data == "adm_stats":
+        if not is_admin(uid):
+            return await safe_edit(query, "⛔ Доступ запрещён.", back_keyboard())
+
+        total_games = sum(x["games"] for x in USERS.values())
+        return await safe_edit(
+            query,
+            f"📊 АДМИН · СТАТИСТИКА\n"
+            f"{separator()}\n\n"
+            f"👥 Пользователей: {len(USERS)}\n"
+            f"🎮 Игр: {total_games}\n"
+            f"📋 Транзакций: {len(TRANSACTIONS)}",
+            admin_keyboard(),
+        )
+
+    if data == "adm_logs":
+        if not is_admin(uid):
+            return await safe_edit(query, "⛔ Доступ запрещён.", back_keyboard())
+
+        lines = ["📋 АДМИН · ЛОГИ", separator(), ""]
+        for entry in TRANSACTIONS[-8:][::-1]:
+            lines.append(
+                f"👤 {entry['user_id']} · "
+                f"{entry['type']} · "
+                f"{entry['amount']:+} · "
+                f"{entry['description']}"
+            )
+
+        return await safe_edit(
+            query,
+            "\n".join(lines),
+            admin_keyboard(),
+        )
+
+    if data in {"adm_users", "adm_balance"}:
+        if not is_admin(uid):
+            return await safe_edit(query, "⛔ Доступ запрещён.", back_keyboard())
+
+        return await safe_edit(
+            query,
+            f"🛠️ АДМИН · КОМАНДЫ\n"
+            f"{separator()}\n\n"
+            f"👤 /user ID\n"
+            f"💰 /addbalance ID SUM REASON\n"
+            f"💸 /removebalance ID SUM REASON\n"
+            f"🚫 /ban ID REASON\n"
+            f"✅ /unban ID",
+            admin_keyboard(),
+        )
+
+    # ---------- Future catalog entries ----------
+    if data.startswith("soon:"):
+        return await safe_edit(
+            query,
+            f"🎮 ИГРА ПОКА В РАЗРАБОТКЕ\n"
+            f"{separator()}\n\n"
+            f"⚙️ Этот раздел уже добавлен в каталог.\n"
+            f"Следующим обновлением его можно подключить.",
+            back_keyboard(),
+        )
+
+
+# ----------------------------------------------------------
+# Chat
+# ----------------------------------------------------------
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("chat_mode"):
         return
-    context.user_data["chat"] = False
+
+    context.user_data["chat_mode"] = False
     await update.message.reply_text(
-        "Chat пока работает в базовом режиме. Для полноценной AI-модели "
-        "добавьте совместимый API в следующей версии."
+        f"💬 CHAT\n"
+        f"{separator()}\n\n"
+        f"Сообщение получено.\n"
+        f"AI API можно подключить через отдельный ключ и модель.",
+        reply_markup=back_keyboard(),
     )
 
-# ---------------- FastAPI / Render ----------------
 
-telegram_app = None
+# ----------------------------------------------------------
+# FastAPI / Render
+# ----------------------------------------------------------
+
+telegram_app: Application | None = None
+
 
 @asynccontextmanager
-async def lifespan(app):
+async def lifespan(app: FastAPI):
     global telegram_app
+
     telegram_app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -716,32 +1460,35 @@ async def lifespan(app):
     )
 
     telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("admin", admin))
+    telegram_app.add_handler(CommandHandler("admin", admin_command))
+    telegram_app.add_handler(CommandHandler("user", user_command))
     telegram_app.add_handler(CommandHandler("addbalance", addbalance))
     telegram_app.add_handler(CommandHandler("removebalance", removebalance))
     telegram_app.add_handler(CommandHandler("ban", ban))
     telegram_app.add_handler(CommandHandler("unban", unban))
     telegram_app.add_handler(CommandHandler("stats", stats))
     telegram_app.add_handler(CallbackQueryHandler(callback))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    telegram_app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler,
+        )
+    )
 
     await telegram_app.initialize()
     await telegram_app.start()
 
-    public_url = os.getenv("WEBHOOK_URL", "").rstrip("/")
-    secret = os.getenv("WEBHOOK_SECRET", "nezzx-webhook-secret")
-
-    if public_url:
+    if WEBHOOK_URL:
         await telegram_app.bot.set_webhook(
-            url=f"{public_url}/telegram/webhook",
-            secret_token=secret
+            url=f"{WEBHOOK_URL}/telegram/webhook",
+            secret_token=WEBHOOK_SECRET,
         )
     else:
         await telegram_app.updater.start_polling()
 
     yield
 
-    if public_url:
+    if WEBHOOK_URL:
         await telegram_app.bot.delete_webhook()
     else:
         await telegram_app.updater.stop()
@@ -749,22 +1496,47 @@ async def lifespan(app):
     await telegram_app.stop()
     await telegram_app.shutdown()
 
-api = FastAPI(title="NEZZX GAME", lifespan=lifespan)
+
+api = FastAPI(
+    title="NEZZX GAME",
+    lifespan=lifespan,
+)
+
 
 @api.get("/")
 async def root():
-    return {"name": "NEZZX GAME", "status": "online"}
+    return {
+        "name": "NEZZX GAME",
+        "status": "online",
+    }
+
 
 @api.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "users": len(USERS),
+        "active_games": len(ACTIVE_GAMES),
+    }
+
 
 @api.post("/telegram/webhook")
-async def webhook(update: dict):
+async def telegram_webhook(request: Request):
+    body = await request.json()
+
+    if telegram_app is None:
+        return {"ok": False, "error": "telegram app not ready"}
+
     await telegram_app.update_queue.put(
-        Update.de_json(update, telegram_app.bot)
+        Update.de_json(body, telegram_app.bot)
     )
+
     return {"ok": True}
 
+
 if __name__ == "__main__":
-    uvicorn.run("main:api", host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        "main:api",
+        host="0.0.0.0",
+        port=PORT,
+    )
