@@ -545,15 +545,31 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🟢 АДМИН\n"
         f"{separator()}\n\n"
-        f"👤 /user ID\n"
-        f"💰 /addbalance ID SUM REASON\n"
-        f"💸 /removebalance ID SUM REASON\n"
-        f"🚫 /ban ID REASON\n"
-        f"✅ /unban ID\n"
-        f"📊 /stats",
+        f"👤 Пользователь — посмотреть игрока\n"
+        f"💰 Баланс @username — посмотреть баланс\n"
+        f"➕ Выдать @username 1000 — выдать mCoin\n"
+        f"➖ Снять @username 1000 — снять mCoin\n"
+        f"🚫 Бан @username — заблокировать\n"
+        f"✅ Разбан @username — разблокировать\n"
+        f"📊 Статистика — статистика",
         reply_markup=admin_keyboard(),
     )
 
+
+def find_user_by_ref(ref: str):
+    ref = ref.strip().lstrip("@").lower()
+    if ref.isdigit():
+        uid = int(ref)
+        return USERS.get(uid)
+    for user in USERS.values():
+        if str(user.get("username") or "").lower() == ref:
+            return user
+    return None
+
+
+def user_label(user: dict) -> str:
+    username = user.get("username")
+    return f"@{username}" if username else str(user["id"])
 
 async def addbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1429,16 +1445,221 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("chat_mode"):
+    text = (update.message.text or "").strip()
+    if not text:
         return
 
-    context.user_data["chat_mode"] = False
-    await update.message.reply_text(
-        f"💬 CHAT\n"
-        f"{separator()}\n\n"
-        f"Сообщение получено.\n"
-        f"AI API можно подключить через отдельный ключ и модель.",
-        reply_markup=back_keyboard(),
+    uid = update.effective_user.id
+    u = get_user(uid, update.effective_user)
+
+    if u["banned"] and not is_admin(uid):
+        return await update.message.reply_text("🚫 Доступ ограничен администрацией.")
+
+    # Chat mode has priority for arbitrary messages.
+    if context.user_data.get("chat_mode"):
+        context.user_data["chat_mode"] = False
+        return await update.message.reply_text(
+            f"💬 CHAT\n{separator()}\n\n"
+            f"Сообщение получено.\n"
+            f"AI API можно подключить через отдельный ключ и модель.",
+            reply_markup=back_keyboard(),
+        )
+
+    parts = text.split()
+    cmd = parts[0].lower().lstrip("/")
+
+    # Common player words instead of slash commands.
+    aliases = {
+        "старт": "start", "начать": "start", "меню": "start",
+        "баланс": "balance", "б": "balance",
+        "профиль": "profile", "проф": "profile",
+        "игры": "games", "игра": "games", "каталог": "games",
+        "мины": "mines", "мину": "mines",
+        "башня": "tower",
+        "админ": "admin", "админка": "admin",
+        "статистика": "stats", "стата": "stats",
+        "помощь": "help", "команды": "help",
+    }
+    cmd = aliases.get(cmd, cmd)
+
+    if cmd == "start":
+        return await update.message.reply_text(
+            f"💣 Мины Бот\nнеzкс фамилионо...\n\n"
+            f"🎮 ГЛАВНОЕ МЕНЮ\n{separator()}\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"🏆 Уровень: {u['level']}\n⭐ XP: {u['xp']}",
+            reply_markup=home_keyboard(uid),
+        )
+
+    if cmd == "balance":
+        # Admin can check another player's balance: "баланс @username" or "баланс ID".
+        target = u
+        if is_admin(uid) and len(parts) >= 2:
+            target = find_user_by_ref(parts[1])
+            if not target:
+                return await update.message.reply_text("❌ Пользователь не найден.")
+        return await update.message.reply_text(
+            f"💰 БАЛАНС\n{separator()}\n\n"
+            f"👤 {user_label(target)}\n"
+            f"💰 {fmt(target['balance'])} mCoin",
+            reply_markup=back_keyboard(),
+        )
+
+    if cmd == "profile":
+        return await update.message.reply_text(
+            f"👤 ПРОФИЛЬ\n{separator()}\n\n"
+            f"🆔 ID: {uid}\n"
+            f"📛 Username: @{u['username'] or 'нет'}\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"🏆 Уровень: {u['level']}\n⭐ XP: {u['xp']}\n"
+            f"🎮 Игр: {u['games']}\n✅ Побед: {u['wins']}\n💥 Поражений: {u['losses']}",
+            reply_markup=back_keyboard(),
+        )
+
+    if cmd == "games":
+        return await update.message.reply_text(
+            f"🕹 КАТАЛОГ ИГР\n{separator()}\n\n"
+            f"💣 Мины — 1–23 мин\n"
+            f"🏰 Башня — 1–4 мин",
+            reply_markup=catalog_keyboard(),
+        )
+
+    if cmd == "mines":
+        return await update.message.reply_text(
+            f"🍀 МИНЫ · НАЧНИ ИГРУ!\n{separator()}\n\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"💣 Мин: 1–23\n🎯 Поле: 5×5\n\n"
+            f"💵 Выберите сумму ставки:",
+            reply_markup=amount_keyboard("mines_bet"),
+        )
+
+    if cmd == "tower":
+        return await update.message.reply_text(
+            f"🏰 БАШНЯ · НАЧНИ ИГРУ!\n{separator()}\n\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"💣 Мин: 1–4\n\n"
+            f"💵 Выберите сумму ставки:",
+            reply_markup=amount_keyboard("tower_bet"),
+        )
+
+    if cmd == "help":
+        return await update.message.reply_text(
+            f"📖 ПОМОЩЬ\n{separator()}\n\n"
+            f"Просто напиши слово без /:\n"
+            f"💰 баланс\n👤 профиль\n🎮 игры\n"
+            f"💣 мины\n🏰 башня\n📊 статистика\n"
+            f"🟢 админ — только для администраторов",
+            reply_markup=back_keyboard(),
+        )
+
+    # Admin-only natural language commands.
+    if cmd in {"выдать", "начислить", "добавить"}:
+        if not is_admin(uid):
+            return await update.message.reply_text("⛔ Доступ запрещён.")
+        if len(parts) < 3:
+            return await update.message.reply_text("Формат: Выдать @username СУММА")
+        target = find_user_by_ref(parts[1])
+        if not target:
+            return await update.message.reply_text("❌ Пользователь не найден.")
+        try:
+            amount = abs(int(parts[2]))
+        except ValueError:
+            return await update.message.reply_text("❌ Сумма должна быть числом.")
+        reason = " ".join(parts[3:]) or "Выдача администратором"
+        old = target["balance"]
+        new = change_balance(target["id"], amount, "admin_add", reason, admin_id=uid)
+        return await update.message.reply_text(
+            f"✅ Баланс выдан\n\n👤 {user_label(target)}\n"
+            f"💰 Было: {fmt(old)} mCoin\n➕ Выдано: {fmt(amount)} mCoin\n"
+            f"💰 Стало: {fmt(new)} mCoin"
+        )
+
+    if cmd in {"бан", "забанить"}:
+        if not is_admin(uid):
+            return await update.message.reply_text("⛔ Доступ запрещён.")
+        if len(parts) < 2:
+            return await update.message.reply_text("Формат: Бан @username")
+        target = find_user_by_ref(parts[1])
+        if not target:
+            return await update.message.reply_text("❌ Пользователь не найден.")
+        target["banned"] = True
+        return await update.message.reply_text(f"🚫 {user_label(target)} заблокирован.")
+
+    if cmd in {"разбан", "разблокировать"}:
+        if not is_admin(uid):
+            return await update.message.reply_text("⛔ Доступ запрещён.")
+        if len(parts) < 2:
+            return await update.message.reply_text("Формат: Разбан @username")
+        target = find_user_by_ref(parts[1])
+        if not target:
+            return await update.message.reply_text("❌ Пользователь не найден.")
+        target["banned"] = False
+        return await update.message.reply_text(f"✅ {user_label(target)} разблокирован.")
+
+    if cmd in {"снять", "убрать", "вычесть"}:
+        if not is_admin(uid):
+            return await update.message.reply_text("⛔ Доступ запрещён.")
+        if len(parts) < 3:
+            return await update.message.reply_text("Формат: Снять @username СУММА")
+        target = find_user_by_ref(parts[1])
+        if not target:
+            return await update.message.reply_text("❌ Пользователь не найден.")
+        try:
+            amount = abs(int(parts[2]))
+        except ValueError:
+            return await update.message.reply_text("❌ Сумма должна быть числом.")
+        reason = " ".join(parts[3:]) or "Списание администратором"
+        old = target["balance"]
+        new = change_balance(target["id"], -amount, "admin_remove", reason, admin_id=uid)
+        return await update.message.reply_text(
+            f"✅ Баланс изменён\n\n👤 {user_label(target)}\n"
+            f"💰 Было: {fmt(old)} mCoin\n➖ Снято: {fmt(amount)} mCoin\n"
+            f"💰 Стало: {fmt(new)} mCoin"
+        )
+
+    if cmd == "админ" and is_admin(uid):
+        return await admin_command(update, context)
+
+    if cmd == "stats" and is_admin(uid):
+        total_games = sum(x["games"] for x in USERS.values())
+        total_balance = sum(x["balance"] for x in USERS.values())
+        return await update.message.reply_text(
+            f"📊 СТАТИСТИКА\n{separator()}\n\n"
+            f"👥 Пользователей: {len(USERS)}\n"
+            f"🎮 Игр: {total_games}\n"
+            f"💰 Баланс: {fmt(total_balance)} mCoin\n"
+            f"📋 Транзакций: {len(TRANSACTIONS)}"
+        )
+
+    # Admin: balance/profile lookup by username or ID.
+    if cmd in {"юзер", "пользователь", "инфо"}:
+        if not is_admin(uid):
+            return await update.message.reply_text("⛔ Доступ запрещён.")
+        if len(parts) < 2:
+            return await update.message.reply_text("Формат: Юзер @username или ID")
+        target = find_user_by_ref(parts[1])
+        if not target:
+            return await update.message.reply_text("❌ Пользователь не найден.")
+        return await update.message.reply_text(
+            f"👤 ПОЛЬЗОВАТЕЛЬ\n{separator()}\n\n"
+            f"🆔 ID: {target['id']}\n"
+            f"📛 Username: @{target['username'] or 'нет'}\n"
+            f"💰 Баланс: {fmt(target['balance'])} mCoin\n"
+            f"🏆 Уровень: {target['level']}\n⭐ XP: {target['xp']}\n"
+            f"🎮 Игр: {target['games']}\n🚫 Бан: {'да' if target['banned'] else 'нет'}"
+        )
+
+    # If a plain username is sent by an admin, show its balance.
+    if is_admin(uid) and text.startswith("@") and len(parts) == 1:
+        target = find_user_by_ref(text)
+        if target:
+            return await update.message.reply_text(
+                f"💰 Баланс {user_label(target)}: {fmt(target['balance'])} mCoin"
+            )
+
+    # Keep unknown text quiet instead of treating it as a slash command.
+    return await update.message.reply_text(
+        "❓ Не понял сообщение. Напиши «помощь», чтобы увидеть доступные слова."
     )
 
 
@@ -1460,13 +1681,6 @@ async def lifespan(app: FastAPI):
     )
 
     telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("admin", admin_command))
-    telegram_app.add_handler(CommandHandler("user", user_command))
-    telegram_app.add_handler(CommandHandler("addbalance", addbalance))
-    telegram_app.add_handler(CommandHandler("removebalance", removebalance))
-    telegram_app.add_handler(CommandHandler("ban", ban))
-    telegram_app.add_handler(CommandHandler("unban", unban))
-    telegram_app.add_handler(CommandHandler("stats", stats))
     telegram_app.add_handler(CallbackQueryHandler(callback))
     telegram_app.add_handler(
         MessageHandler(
