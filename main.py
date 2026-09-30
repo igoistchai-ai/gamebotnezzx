@@ -708,6 +708,395 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+# ----------------------------------------------------------
+# Text command info
+# ----------------------------------------------------------
+
+def info_text(user_id: int) -> str:
+    base = (
+        "📖 ИНФО\n"
+        f"{separator()}\n\n"
+        "🎮 ИГРЫ\n"
+        "• мины — открыть Mines\n"
+        "• башня — открыть Tower\n"
+        "• игры — каталог игр\n\n"
+        "💰 АККАУНТ\n"
+        "• баланс — показать баланс\n"
+        "• профиль — открыть профиль\n"
+        "• бонус — получить ежедневный бонус\n"
+        "• рейтинг — рейтинг игроков\n"
+        "• рефералы — реферальная ссылка\n\n"
+        "📚 ПРОЧЕЕ\n"
+        "• инфо — показать этот список\n"
+        "• помощь — правила и помощь\n"
+    )
+
+    if is_admin(user_id):
+        base += (
+            "\n🟢 АДМИН\n"
+            "• выдать @username сумма — выдать mCoin\n"
+            "• снять @username сумма — снять mCoin\n"
+            "• инфо @username — данные игрока\n"
+            "• бан @username — заблокировать игрока\n"
+            "• разбан @username — снять блокировку\n"
+            "• статистика — статистика бота\n"
+        )
+
+    return base
+
+
+def normalize_text(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Natural-language commands without slash prefixes."""
+    uid = update.effective_user.id
+    u = get_user(uid, update.effective_user)
+
+    if u["banned"]:
+        await update.message.reply_text("🚫 Доступ ограничен администрацией.")
+        return
+
+    raw = update.message.text or ""
+    text = normalize_text(raw)
+
+    # Info/help
+    if text in {"инфо", "команды", "команды бота", "список команд"}:
+        await update.message.reply_text(
+            info_text(uid),
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    if text in {"помощь", "help"}:
+        await update.message.reply_text(
+            "📖 ПОМОЩЬ\n"
+            f"{separator()}\n\n"
+            "💣 Мины — поле 5×5, мин: 1–23.\n"
+            "🏰 Башня — 10 этажей, мин: 1–4.\n"
+            "💰 Cashout забирает текущую виртуальную награду.\n"
+            "🔑 Честность показывает hash игрового seed.\n\n"
+            "Все mCoin в боте являются виртуальными баллами.",
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    # User actions
+    if text in {"баланс", "б"}:
+        await update.message.reply_text(
+            f"💰 БАЛАНС\n{separator()}\n\n"
+            f"💵 {fmt(u['balance'])} mCoin",
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    if text in {"профиль", "проф"}:
+        games = u["games"]
+        winrate = (u["wins"] / games * 100) if games else 0
+        await update.message.reply_text(
+            f"👤 ПРОФИЛЬ\n{separator()}\n\n"
+            f"🆔 ID: {uid}\n"
+            f"📛 Username: @{u['username'] or 'нет'}\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            f"🏆 Уровень: {u['level']}\n"
+            f"⭐ XP: {u['xp']}\n"
+            f"🎮 Игр: {games}\n"
+            f"✅ Побед: {u['wins']}\n"
+            f"💥 Поражений: {u['losses']}\n"
+            f"📈 Winrate: {winrate:.1f}%\n"
+            f"🔥 Streak: {u['streak']}",
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    if text in {"игры", "игра", "каталог"}:
+        await update.message.reply_text(
+            "🕹 КАТАЛОГ ИГР\n"
+            f"{separator()}\n\n"
+            "💣 Мины — 1–23 мин\n"
+            "🏰 Башня — 1–4 мин",
+            reply_markup=catalog_keyboard(),
+        )
+        return
+
+    if text in {"мины", "мин", "mines"}:
+        await update.message.reply_text(
+            f"🍀 МИНЫ\n{separator()}\n\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            "💣 Выберите ставку:",
+            reply_markup=amount_keyboard("mines_bet"),
+        )
+        return
+
+    if text in {"башня", "tower"}:
+        await update.message.reply_text(
+            f"🏰 БАШНЯ\n{separator()}\n\n"
+            f"💰 Баланс: {fmt(u['balance'])} mCoin\n"
+            "💵 Выберите ставку:",
+            reply_markup=amount_keyboard("tower_bet", include_all=True),
+        )
+        return
+
+    if text in {"бонус", "бонусы", "bonus"}:
+        last = DAILY_BONUS_STATE.get(uid)
+        if last and now() - last < timedelta(hours=24):
+            await update.message.reply_text(
+                "🎁 БОНУС\n"
+                f"{separator()}\n\n"
+                "⏳ Ежедневный бонус уже получен.\n"
+                "Возвращайтесь после 24 часов.",
+                reply_markup=home_keyboard(uid),
+            )
+            return
+
+        DAILY_BONUS_STATE[uid] = now()
+        u["streak"] += 1
+        reward = DAILY_BONUS + max(0, u["streak"] - 1) * 250
+        change_balance(uid, reward, "daily_bonus", "Ежедневный бонус")
+        add_xp(u, 20)
+
+        await update.message.reply_text(
+            f"🎁 БОНУС\n{separator()}\n\n"
+            f"🎉 +{fmt(reward)} mCoin\n"
+            f"🔥 Streak: {u['streak']}",
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    if text in {"рейтинг", "топ", "топ игроков"}:
+        top = sorted(USERS.values(), key=lambda x: x["balance"], reverse=True)[:10]
+        lines = ["🏆 РЕЙТИНГ", separator(), ""]
+        for index, item in enumerate(top, 1):
+            name = item["first_name"] or str(item["id"])
+            lines.append(f"{index}. {name} — {fmt(item['balance'])} mCoin")
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    if text in {"рефералы", "реф", "реферал"}:
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start=ref_{uid}"
+        count = sum(1 for ref in REFERRALS.values() if ref == uid)
+        await update.message.reply_text(
+            f"🎟 РЕФЕРАЛЫ\n{separator()}\n\n"
+            f"👥 Приглашено: {count}\n\n"
+            f"🔗 {link}",
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    # Admin natural-language actions
+    if is_admin(uid):
+        parts = raw.strip().split()
+        command = parts[0].lower() if parts else ""
+
+        if command in {"статистика", "стата"}:
+            total_games = sum(x["games"] for x in USERS.values())
+            total_balance = sum(x["balance"] for x in USERS.values())
+            await update.message.reply_text(
+                f"📊 СТАТИСТИКА\n{separator()}\n\n"
+                f"👥 Пользователей: {len(USERS)}\n"
+                f"🎮 Игр: {total_games}\n"
+                f"💰 Баланс всех: {fmt(total_balance)} mCoin\n"
+                f"📋 Транзакций: {len(TRANSACTIONS)}"
+            )
+            return
+
+        if command in {"выдать", "выдатьбаланс"} and len(parts) >= 3:
+            target = parts[1]
+            try:
+                amount = int(parts[2])
+            except ValueError:
+                await update.message.reply_text("❌ Сумма должна быть числом.")
+                return
+
+            target_user = None
+            if target.startswith("@"):
+                username = target[1:].lower()
+                for item in USERS.values():
+                    if (item.get("username") or "").lower() == username:
+                        target_user = item
+                        break
+            else:
+                try:
+                    target_user = get_user(int(target))
+                except ValueError:
+                    pass
+
+            if not target_user:
+                await update.message.reply_text("❌ Пользователь не найден.")
+                return
+
+            old = target_user["balance"]
+            new = change_balance(
+                target_user["id"],
+                abs(amount),
+                "admin_add",
+                "Выдано администратором",
+                admin_id=uid,
+            )
+            await update.message.reply_text(
+                f"✅ Баланс выдан\n\n"
+                f"👤 ID: {target_user['id']}\n"
+                f"💰 Было: {fmt(old)}\n"
+                f"➕ Выдано: {fmt(abs(amount))}\n"
+                f"💰 Стало: {fmt(new)}"
+            )
+            return
+
+        if command in {"снять", "снятьбаланс"} and len(parts) >= 3:
+            target = parts[1]
+            try:
+                amount = abs(int(parts[2]))
+            except ValueError:
+                await update.message.reply_text("❌ Сумма должна быть числом.")
+                return
+
+            target_user = None
+            if target.startswith("@"):
+                username = target[1:].lower()
+                for item in USERS.values():
+                    if (item.get("username") or "").lower() == username:
+                        target_user = item
+                        break
+            else:
+                try:
+                    target_user = get_user(int(target))
+                except ValueError:
+                    pass
+
+            if not target_user:
+                await update.message.reply_text("❌ Пользователь не найден.")
+                return
+
+            try:
+                old = target_user["balance"]
+                new = change_balance(
+                    target_user["id"],
+                    -amount,
+                    "admin_remove",
+                    "Снято администратором",
+                    admin_id=uid,
+                )
+            except ValueError:
+                await update.message.reply_text("❌ У пользователя недостаточно mCoin.")
+                return
+
+            await update.message.reply_text(
+                f"✅ Баланс снят\n\n"
+                f"👤 ID: {target_user['id']}\n"
+                f"💰 Было: {fmt(old)}\n"
+                f"➖ Снято: {fmt(amount)}\n"
+                f"💰 Стало: {fmt(new)}"
+            )
+            return
+
+        if command == "бан" and len(parts) >= 2:
+            target = parts[1]
+            target_user = None
+            if target.startswith("@"):
+                username = target[1:].lower()
+                for item in USERS.values():
+                    if (item.get("username") or "").lower() == username:
+                        target_user = item
+                        break
+            else:
+                try:
+                    target_user = get_user(int(target))
+                except ValueError:
+                    pass
+
+            if not target_user:
+                await update.message.reply_text("❌ Пользователь не найден.")
+                return
+
+            target_user["banned"] = True
+            await update.message.reply_text(
+                f"🚫 Пользователь {target_user['id']} заблокирован."
+            )
+            return
+
+        if command == "разбан" and len(parts) >= 2:
+            target = parts[1]
+            target_user = None
+            if target.startswith("@"):
+                username = target[1:].lower()
+                for item in USERS.values():
+                    if (item.get("username") or "").lower() == username:
+                        target_user = item
+                        break
+            else:
+                try:
+                    target_user = get_user(int(target))
+                except ValueError:
+                    pass
+
+            if not target_user:
+                await update.message.reply_text("❌ Пользователь не найден.")
+                return
+
+            target_user["banned"] = False
+            await update.message.reply_text(
+                f"✅ Пользователь {target_user['id']} разблокирован."
+            )
+            return
+
+        if command in {"инфо", "юзер"} and len(parts) >= 2:
+            target = parts[1]
+            target_user = None
+            if target.startswith("@"):
+                username = target[1:].lower()
+                for item in USERS.values():
+                    if (item.get("username") or "").lower() == username:
+                        target_user = item
+                        break
+            else:
+                try:
+                    target_user = get_user(int(target))
+                except ValueError:
+                    pass
+
+            if not target_user:
+                await update.message.reply_text("❌ Пользователь не найден.")
+                return
+
+            await update.message.reply_text(
+                f"👤 ПОЛЬЗОВАТЕЛЬ\n{separator()}\n\n"
+                f"🆔 ID: {target_user['id']}\n"
+                f"📛 Username: @{target_user['username'] or 'нет'}\n"
+                f"💰 Баланс: {fmt(target_user['balance'])} mCoin\n"
+                f"🏆 Уровень: {target_user['level']}\n"
+                f"⭐ XP: {target_user['xp']}\n"
+                f"🎮 Игр: {target_user['games']}\n"
+                f"✅ Побед: {target_user['wins']}\n"
+                f"💥 Поражений: {target_user['losses']}\n"
+                f"🚫 Бан: {'да' if target_user['banned'] else 'нет'}"
+            )
+            return
+
+    # Chat mode has priority only if no known command matched.
+    if context.user_data.get("chat_mode"):
+        context.user_data["chat_mode"] = False
+        await update.message.reply_text(
+            "💬 CHAT\n"
+            f"{separator()}\n\n"
+            "Сообщение получено.\n"
+            "AI API можно подключить отдельным ключом.",
+            reply_markup=home_keyboard(uid),
+        )
+        return
+
+    await update.message.reply_text(
+        "❓ Неизвестная команда.\n\n"
+        "Напишите «инфо», чтобы увидеть список доступных действий.",
+        reply_markup=home_keyboard(uid),
+    )
+
+
 # ----------------------------------------------------------
 # Callback router
 # ----------------------------------------------------------
@@ -1685,7 +2074,7 @@ async def lifespan(app: FastAPI):
     telegram_app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            text_handler,
+            handle_text_commands,
         )
     )
 
